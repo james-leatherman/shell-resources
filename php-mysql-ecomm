@@ -1,0 +1,177 @@
+#!/bin/bash
+
+function status_message(){
+  NC='\033[0m' # No Color
+  case $1 in
+    "INFO") COLOR='\033[0;34m' ;;
+    "SUCCESS") COLOR='\033[0;32m' ;;
+    "WARNING") COLOR='\033[0;33m' ;;
+    "FAILURE") COLOR='\033[0;31m' ;;
+    *) COLOR='\033[0m' ;;
+  esac
+  echo -e "\n${COLOR} $2 ${NC}\n"
+}
+
+function check_service(){
+  service_is_active=$(sudo systemctl is-active $1)
+  if [ "$service_is_active" = "active" ]
+  then
+    status_message "SUCCESS" "$1 is active and running"
+  else
+    status_message "FAILURE" "$1 is not active/running"
+    exit 1
+  fi
+}
+
+function check_firewall(){
+  firewalld_ports=$(sudo firewall-cmd --list-all --zone=public | grep ports)
+  if [[ "$firewalld_ports" == *"$1"* ]]
+  then
+    status_message "SUCCESS" "FirewallD has port $1 configured"
+  else
+    status_message "FAILURE" "FirewallD port $1 is not configured"
+    exit 1
+  fi
+}
+
+function check_site(){
+  if [[ "$1" = *"$2"* ]]
+  then
+    status_message "SUCCESS" "Item $2 is present on the web page"
+  else
+    status_message "FAILURE" "Item $2 is not present on the web page"
+  fi
+}
+
+# Deploy Pre-Requisites
+# Install FirewallD
+status_message "INFO" "Installing firewalld"
+sudo yum install -y firewalld
+sudo systemctl start firewalld
+sudo systemctl enable firewalld
+check_service firewalld
+
+# Deploy and Configure Database
+# Install MariaDB
+status_message "INFO" "Installing mariadb"
+sudo yum install -y mariadb-server
+sudo touch /etc/my.cnf
+sudo systemctl start mariadb
+sudo systemctl enable mariadb
+check_service mariadb
+
+# Configure firewall for Database
+status_message "INFO" "Configuring firewall for db"
+sudo firewall-cmd --permanent --zone=public --add-port=3306/tcp
+sudo firewall-cmd --reload
+check_firewall 3306
+
+# Configure Database
+status_message "INFO" "Creating database config file"
+sudo tee setup-db.sql > /dev/null <<-EOF
+CREATE DATABASE ecomdb;
+CREATE USER 'ecomuser'@'localhost' IDENTIFIED BY 'ecompassword';
+GRANT ALL PRIVILEGES ON *.* TO 'ecomuser'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+status_message "INFO" "Loading database config"
+sudo mysql  -u root < setup-db.sql
+# ON a multi-node setup, replace 'localhost' with the IP address of the web server in the database user configuration: 'ecomuser'@'web-server-ip'.
+# For more details on configuring multi-node setups, refer to: https://mariadb.com/kb/en/configuring-mariadb-for-remote-client-access/
+
+# Load Product Inventory Information to database
+# Create the db-load-script.sql
+status_message "INFO" "Creating products table and data file"
+sudo tee db-load-script.sql > /dev/null <<-EOF
+USE ecomdb;
+CREATE TABLE products (
+  id mediumint(8) unsigned NOT NULL auto_increment,
+  Name varchar(255) DEFAULT NULL,
+  Price varchar(255) DEFAULT NULL,
+  ImageUrl varchar(255) DEFAULT NULL,
+  PRIMARY KEY (id)
+) AUTO_INCREMENT=1;
+INSERT INTO products (Name,Price,ImageUrl) VALUES 
+("Laptop","100","c-1.png"),
+("Drone","200","c-2.png"),
+("VR","300","c-3.png"),
+("Tablet","50","c-5.png"),
+("Watch","90","c-6.png"),
+("Phone Covers","20","c-7.png"),
+("Phone","80","c-8.png"),
+("Laptop","150","c-4.png");
+EOF
+
+# Run sql script
+status_message "INFO" "Loading data into products table"
+sudo mysql -u ecomuser -p'ecompassword' < db-load-script.sql
+
+# Check if data is loaded
+mysql_db_results=$(sudo mysql -e "use ecomdb; select * from products;")
+if [[ $mysql_db_results == *Laptop* ]]
+then
+  status_message "SUCCESS" "Inventory data loaded into db"
+else
+  status_message "FAILURE" "Inventory data not loaded into db"
+  exit 1
+fi
+
+# Deploy and Configure Web
+# Install required packages
+status_message "INFO" "Installing httpd"
+sudo yum install -y httpd php php-mysqlnd
+
+# Configure web firewall
+status_message "INFO" "Configuring firewall for httpd"
+sudo firewall-cmd --permanent --zone=public --add-port=80/tcp
+sudo firewall-cmd --reload
+check_firewall 80
+
+# Configure httpd
+# Change DirectoryIndex index.html to DirectoryIndex index.php to make the php page the default page
+status_message "INFO" "Configuring httpd.conf"
+sudo sed -i 's/index.html/index.php/g' /etc/httpd/conf/httpd.conf
+
+# Start httpd
+status_message "INFO" "Starting httpd"
+sudo systemctl start httpd
+sudo systemctl enable httpd
+check_service httpd
+
+# Download code from GitHub
+status_message "INFO" "Installing git"
+sudo yum install -y git
+echo "Cloning repo locally"
+sudo git clone https://github.com/kodekloudhub/learning-app-ecommerce.git /var/www/html/
+
+# Create and configure the .env File
+status_message "INFO" "Creating .env file"
+sudo tee /etc/httpd/conf.d/ecom-env.conf > /dev/null <<-EOF
+SetEnv DB_HOST localhost
+SetEnv DB_USER ecomuser
+SetEnv DB_PASSWORD ecompassword
+SetEnv DB_NAME ecomdb
+EOF
+
+# Restart httpd
+status_message "INFO" "Restarting httpd"
+sudo systemctl restart httpd
+check_service httpd
+
+# Test the site
+status_message "INFO" "Testing site"
+web_page=$(curl http://localhost)
+
+# Check for "error" in the web page
+if [[ "$web_page" == *"error"* ]]
+then
+    status_message "FAILURE" "Error found in web page"
+    exit 1
+else
+    status_message "SUCCESS" "No errors found in web page"
+for item in "Laptop" "Drone" "VR" "Tablet" "Watch" "Phone Covers" "Phone"
+do
+  check_site "$web_page" "$item"
+done
+fi
